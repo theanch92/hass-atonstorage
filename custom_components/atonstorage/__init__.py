@@ -1,5 +1,6 @@
 """AtonStorage integration."""
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -138,13 +139,22 @@ class AtonStorageUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch data from AtonStorage."""
-        _LOGGER.debug("refreshing data")
-        async with async_timeout.timeout(self.update_interval.seconds):
-            try:
+        _LOGGER.debug("Refreshing AtonStorage data for %s", self.serial_number)
+        try:
+            # Use a slightly longer timeout than the sum of internal request timeouts
+            # to avoid premature cancellation.
+            async with async_timeout.timeout(self.update_interval.seconds + 30):
                 await self.bridge.refresh()
-            except Exception as err:
-                raise UpdateFailed(
-                    f"Could not update {self.serial_number} values: {err}"
-                ) from err
-            if not self.bridge.status:
-                raise UpdateFailed("Error fetching AtonStorage state")
+        except asyncio.TimeoutError as err:
+            raise UpdateFailed(
+                f"Timeout updating {self.serial_number} values: {err}"
+            ) from err
+        except Exception as err:
+            raise UpdateFailed(
+                f"Could not update {self.serial_number} values: {err}"
+            ) from err
+
+        if not self.bridge.data or "status" not in self.bridge.data:
+            raise UpdateFailed("Error fetching AtonStorage state: data incomplete")
+
+        return self.bridge.data
