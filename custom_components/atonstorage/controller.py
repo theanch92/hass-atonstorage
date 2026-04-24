@@ -4,6 +4,7 @@ import logging
 import re
 from datetime import datetime
 
+import httpx
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.httpx_client import get_async_client
 
@@ -18,16 +19,6 @@ _SET_REQUEST_ENDPOINT = (
     _BASEURL
     + "set_request.php?request=MONITOR&intervallo={interval}&sn={serial_number}"
 )
-# _ENDPOINT = "https://www.atonstorage.com/atonTC/get_monitor.php?sn={serialNumber}&_={timestamp}"
-# https://www.atonstorage.com/atonTC/set_request.php?sn={serialNumber}&request=MONITOR&intervallo=15&_={timestamp}
-# https://www.atonstorage.com/atonTC/getAlarmDesc.php?sn={serialNumber}&_={timestamp}
-# https://www.atonstorage.com/atonTC/hasExternalEV.php?id_impianto=151762966&_={timestamp}
-# https://www.atonstorage.com/atonTC/get_monitorToday.php?&sn={serialNumber}&_={timestamp}
-# https://www.atonstorage.com/atonTC/get_energy.php?anno=2022&mese=11&giorno=9&idImpianto=151762966&intervallo=d&potNom=3500&batNom=3500&sn={serialNumber}&_={timestamp}
-# https://www.atonstorage.com/atonTC/get_vbib.php?anno=2022&mese=11&sn={serialNumber}&_={timestamp}
-# https://www.atonstorage.com/atonTC/get_allarmi_oggi.php?sn={serialNumber}&idImpianto=151762966&tipoUtente=1&_={timestamp}
-# https://www.atonstorage.com/atonTC/checkTShift.php?sn={serialNumber}&_={timestamp}
-# https://www.atonstorage.com/atonTC/getTShift.php?sn={serialNumber}&_={timestamp}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,154 +26,149 @@ _LOGGER = logging.getLogger(__name__)
 class Controller:
     """Define a generic AtonStorage sensor."""
 
-    _session = None
-    data = None
-    _hass: HomeAssistant = None
-    _async_client = None
-    _id_plant = None
-
     def __init__(self, hass: HomeAssistant, user, password, serial_number, opts):
         """Initialize."""
-
-        # if user is None or password is None:
-        #    raise UsernameAndPasswordRequiredError
 
         if serial_number is None:
             raise SerialNumberRequiredError
 
         self._hass = hass
-
         self._user = user
         self._password = password
         self._serial_number = serial_number
-        # self._id_plant = serial_number    #TODO
         self._opts = opts
         self._session = None
+        self._id_plant = None
+        self.data = {}
         self._async_client = get_async_client(hass, verify_ssl=False)
 
     async def login(self) -> bool:
         """Login to Aton server."""
+        try:
+            _LOGGER.debug("Logging in to Aton server")
+            login_page = await self._async_client.get(_LOGIN_ENDPOINT, timeout=30)
+            login_page.raise_for_status()
 
-        login = await self._async_client.get(_LOGIN_ENDPOINT, timeout=60)
+            login_resp = await self._async_client.post(
+                _LOGIN_ENDPOINT,
+                timeout=30,
+                data={
+                    "username": self._user,
+                    "password": self._password,
+                },
+                cookies=login_page.cookies,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            login_resp.raise_for_status()
 
-        login = await self._async_client.post(
-            _LOGIN_ENDPOINT,
-            timeout=60,
-            data="username={user}&password={password}".format(
-                user=self._user, password=self._password
-            ),
-            cookies=login.cookies,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+            if login_resp.headers.get("Set-Cookie"):
+                self._session = login_resp.cookies
+                _LOGGER.info("Logged in successfully")
 
-        if login.headers is not None and login.headers["Set-Cookie"] is not None:
-            self._session = login.cookies
-            _LOGGER.info("Logged in")
+                # get plant id
+                p = re.compile(r"var idImpianto = (.*);")
+                result = p.search(login_resp.text)
+                if result:
+                    self._id_plant = result.group(1).strip().strip("'").strip('"')
+                    _LOGGER.info("idImpianto=%s", self._id_plant)
+                    return True
+                else:
+                    _LOGGER.error("Could not find idImpianto in login response")
+            else:
+                _LOGGER.error("Login failed: No Set-Cookie header received")
+        except httpx.HTTPError as exc:
+            _LOGGER.error("HTTP error during login: %s", exc)
+        except Exception as exc:
+            _LOGGER.error("Unexpected error during login: %s", exc)
 
-            # get plant id
-            p = re.compile("var idImpianto = (.*);")
-            result = p.search(login.content.decode("utf-8"))
-            self._id_plant = result.group(1)
-            _LOGGER.info("idImpianto=%s", self._id_plant)
-
-            return True
         return False
+
+    def _check_response(self, response: httpx.Response):
+        """Check if response is authorized and successful."""
+        response.raise_for_status()
+        if response.text == "Unauthorized":
+            _LOGGER.warning("Session unauthorized, clearing session")
+            self._session = None
+            raise AtonStorageConnectionError("Unauthorized")
 
     async def refresh(self) -> None:
         """Refresh data from server"""
 
         if self._session is None:
-            login = await self.login()
-            if not login:
+            if not await self.login():
                 raise InvalidUsernameOrPasswordError
 
         try:
-            set_interval = await self._async_client.get(
+            # Set refresh interval
+            interval = self._opts.get("interval", 15)
+            set_interval_resp = await self._async_client.get(
                 _SET_REQUEST_ENDPOINT.format(
                     serial_number=self._serial_number,
-                    interval=self._opts["interval"] | 15,
+                    interval=interval,
                 ),
-                timeout=60,
+                timeout=30,
                 cookies=self._session,
             )
-            if set_interval.content is None:
-                _LOGGER.error("Unable to set refresh interval")
-                raise AtonStorageConnectionError
-            elif set_interval.content == "Unauthorized":
-                self._session = None
-                raise AtonStorageConnectionError
+            self._check_response(set_interval_resp)
 
-            monitor = await self._async_client.get(
+            # Fetch monitor data
+            monitor_resp = await self._async_client.get(
                 _MONITOR_ENDPOINT.format(serial_number=self._serial_number),
-                timeout=60,
+                timeout=30,
                 cookies=self._session,
             )
-            if monitor.content is None:
-                _LOGGER.error("Unable to start fetching data")
-                raise AtonStorageConnectionError
-            elif monitor.content == "Unauthorized":
-                self._session = None
-                raise AtonStorageConnectionError
+            self._check_response(monitor_resp)
 
-            json_dict = monitor.content
-            if json_dict is not None:
-                try:
-                    self.data = json.loads(json_dict)
-                    _LOGGER.debug("Data fetched from resource: %s", json_dict)
-                except ValueError:
-                    _LOGGER.warning("REST result could not be parsed as JSON")
-                    _LOGGER.debug("Erroneous JSON: %s", self.data)
-                except Exception as exc:
-                    _LOGGER.error(exc)
-                    raise exc
-            else:
-                _LOGGER.warning("Empty reply found when expecting JSON data")
+            try:
+                new_data = monitor_resp.json()
+                if not new_data:
+                    _LOGGER.warning("Empty JSON response from monitor")
+                    raise AtonStorageConnectionError("Empty response")
+                self.data.update(new_data)
+                _LOGGER.debug("Monitor data fetched successfully")
+            except (ValueError, json.JSONDecodeError) as exc:
+                _LOGGER.error("Invalid JSON in monitor response. Session might be invalid.")
+                _LOGGER.debug("Response text: %s", monitor_resp.text)
+                self._session = None  # Force re-login
+                raise AtonStorageConnectionError("Invalid JSON in monitor response") from exc
 
-            # hack fix
-            if self._id_plant is not None:
-                energy = await self._async_client.get(
+            # Fetch energy data (hack fix)
+            if self._id_plant:
+                now = datetime.now()
+                energy_resp = await self._async_client.get(
                     _ENERGY_ENDPOINT.format(
                         id=self._id_plant,
-                        year=datetime.now().year,
-                        month=datetime.now().month,
-                        day=datetime.now().day,
+                        year=now.year,
+                        month=now.month,
+                        day=now.day,
                     ),
-                    timeout=60,
+                    timeout=30,
                     cookies=self._session,
                 )
-                if energy.content is None:
-                    _LOGGER.error("Unable to start fetching data")
-                    raise AtonStorageConnectionError
-                elif energy.content == "Unauthorized":
-                    self._session = None
-                    raise AtonStorageConnectionError
-                json_dict_energy = energy.content
-                if json_dict_energy is not None:
-                    try:
-                        energy_data = json.loads(json_dict_energy)
-                        _LOGGER.debug(
-                            "Data fetched from resource: %s", json_dict_energy
-                        )
+                self._check_response(energy_resp)
 
+                try:
+                    energy_data = energy_resp.json()
+                    if energy_data and "tot_pReteOut" in energy_data:
                         self.data["eVenduta"] = energy_data["tot_pReteOut"]
+                        _LOGGER.debug("Energy data fetched successfully")
+                except (ValueError, json.JSONDecodeError):
+                    _LOGGER.warning("Invalid JSON in energy response")
+                    # We don't necessarily clear session here if monitor worked, 
+                    # but it's a bad sign.
 
-                    except ValueError:
-                        _LOGGER.warning("REST result could not be parsed as JSON")
-                        _LOGGER.debug("Erroneous JSON: %s", self.data)
-                    except Exception as exc:
-                        _LOGGER.error(exc)
-                        raise exc
-                else:
-                    _LOGGER.warning("Empty reply found when expecting JSON data")
-
-        except TypeError:
-            _LOGGER.error("Unable to fetch data. Response: %s", self.data)
+        except httpx.HTTPError as exc:
+            _LOGGER.error("HTTP error during refresh: %s", exc)
+            self._session = None # Might be a network issue or session issue, clearing to be safe
+            raise AtonStorageConnectionError(f"HTTP error: {exc}") from exc
+        except AtonStorageConnectionError:
+            raise
         except Exception as exc:
-            _LOGGER.error(exc)
+            _LOGGER.error("Unexpected error during refresh: %s", exc)
             raise exc
 
     def get_raw_data(self, __name: str):
-        return self.data[__name]
+        return self.data.get(__name)
 
     @property
     def grid_to_house(self) -> bool:
