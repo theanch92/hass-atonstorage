@@ -16,9 +16,13 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import slugify
 
 from .const import AVAILABLE_SENSORS, DEFAULT_NAME, DEFAULT_SCAN_INTERVAL, DOMAIN
-from .controller import AtonStorageConnectionError
+from .controller import (
+    AtonStorageConnectionError,
+    InvalidUsernameOrPasswordError,
+    SerialNumberRequiredError,
+    UsernameAndPasswordRequiredError,
+)
 from .controller import Controller as AtonStorage
-from .controller import SerialNumberRequiredError, UsernameAndPasswordRequiredError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +83,8 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                 )
             except AtonStorageConnectionError:
                 errors["base"] = "cannot_connect"
+            except InvalidUsernameOrPasswordError:
+                errors["base"] = "invalid_auth"
             except UsernameAndPasswordRequiredError:
                 errors[CONF_USERNAME] = "username_required"
                 errors[CONF_PASSWORD] = "password_required"
