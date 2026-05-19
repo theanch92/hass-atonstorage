@@ -46,7 +46,9 @@ class Controller:
         """Login to Aton server."""
         try:
             _LOGGER.debug("Logging in to Aton server")
-            login_page = await self._async_client.get(_LOGIN_ENDPOINT, timeout=30)
+            login_page = await self._async_client.get(
+                _LOGIN_ENDPOINT, timeout=30, follow_redirects=True
+            )
             login_page.raise_for_status()
 
             login_resp = await self._async_client.post(
@@ -58,10 +60,11 @@ class Controller:
                 },
                 cookies=login_page.cookies,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                follow_redirects=True,
             )
             login_resp.raise_for_status()
 
-            if login_resp.headers.get("Set-Cookie"):
+            if login_resp.cookies.get("PHPSESSID") or login_resp.headers.get("Set-Cookie"):
                 self._session = login_resp.cookies
                 _LOGGER.info("Logged in successfully")
 
@@ -75,7 +78,7 @@ class Controller:
                 else:
                     _LOGGER.error("Could not find idImpianto in login response")
             else:
-                _LOGGER.error("Login failed: No Set-Cookie header received")
+                _LOGGER.error("Login failed: No session cookie received")
         except httpx.HTTPError as exc:
             _LOGGER.error("HTTP error during login: %s", exc)
         except Exception as exc:
@@ -108,6 +111,7 @@ class Controller:
                 ),
                 timeout=30,
                 cookies=self._session,
+                follow_redirects=True,
             )
             self._check_response(set_interval_resp)
 
@@ -116,6 +120,7 @@ class Controller:
                 _MONITOR_ENDPOINT.format(serial_number=self._serial_number),
                 timeout=30,
                 cookies=self._session,
+                follow_redirects=True,
             )
             self._check_response(monitor_resp)
 
@@ -149,6 +154,7 @@ class Controller:
                     ),
                     timeout=30,
                     cookies=self._session,
+                    follow_redirects=True,
                 )
                 # We don't necessarily want to fail the whole refresh if energy data fails
                 try:
