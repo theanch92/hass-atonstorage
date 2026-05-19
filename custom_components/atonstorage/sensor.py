@@ -567,6 +567,9 @@ class AtonStorageSensorEntity(CoordinatorEntity, SensorEntity):
         else:
             value = self.controller.get_raw_data(self._register_key)
 
+        if value is None:
+            return None
+
         if self.entity_description.value_conversion_function:
             value = self.entity_description.value_conversion_function(value)
 
